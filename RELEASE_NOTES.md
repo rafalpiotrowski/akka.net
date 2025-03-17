@@ -1,3 +1,7 @@
+#### 1.5.40 March 17th, 2025 ####
+
+*Placeholder for nightlies*
+
 #### 1.5.39 March 14th, 2025 ####
 
 Akka.NET v1.5.39 contains a mission-critical bugfix for most Akka.Streams users.
