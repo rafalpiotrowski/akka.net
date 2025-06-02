@@ -58,13 +58,11 @@ namespace Akka.TestKit
 
             try
             {
-                // Actors should not run with ActorCellKeepingSynchronizationContext otherwise continuations in
-                // async message handlers will use ActorCellKeepingSynchronizationContext instead of ActorTaskScheduler
-                // which cause ActorContext to be incorrect.
-                if (currentSyncContext is ActorCellKeepingSynchronizationContext)
-                {
-                    SynchronizationContext.SetSynchronizationContext(null);
-                }
+                // Actors should not run with ActorCellKeepingSynchronizationContext
+                // (or any sync context that wraps ActorCellKeepingSynchronizationContext, e.g. Xunit's AsyncTestSyncContext)
+                // otherwise continuations in async message handlers will use ActorCellKeepingSynchronizationContext
+                // instead of ActorTaskScheduler which causes ActorContext to be incorrect.
+                SynchronizationContext.SetSynchronizationContext(null);
 
                 run.Run();
             }
