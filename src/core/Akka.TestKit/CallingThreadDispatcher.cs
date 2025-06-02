@@ -6,6 +6,7 @@
 //-----------------------------------------------------------------------
 
 using System;
+using System.Threading;
 using Akka.Configuration;
 using Akka.Dispatch;
 
@@ -53,7 +54,24 @@ namespace Akka.TestKit
         
         protected override void ExecuteTask(IRunnable run)
         {
-            run.Run();
+            var currentSyncContext = SynchronizationContext.Current;
+
+            try
+            {
+                // Actors should not run with ActorCellKeepingSynchronizationContext otherwise continuations in
+                // async message handlers will use ActorCellKeepingSynchronizationContext instead of ActorTaskScheduler
+                // which cause ActorContext to be incorrect.
+                if (currentSyncContext is ActorCellKeepingSynchronizationContext)
+                {
+                    SynchronizationContext.SetSynchronizationContext(null);
+                }
+
+                run.Run();
+            }
+            finally
+            {
+                SynchronizationContext.SetSynchronizationContext(currentSyncContext);
+            }
         }
         
         protected override void Shutdown()
