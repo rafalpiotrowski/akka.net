@@ -1,3 +1,7 @@
+#### 1.5.44 June 11th, 2025 ####
+
+*Placeholder for nightlies*
+
 #### 1.5.43 June 10th, 2025 ####
 
 Akka.NET v1.5.43 contains several bug fixes and also adds new quality of life features.
