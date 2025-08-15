@@ -1,4 +1,4 @@
-#### 1.5.48 August 14th, 2025 ####
+#### 1.6.0 August 15th, 2025 ####
 
 **Placeholder for nightly build**
 
