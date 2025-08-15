@@ -464,9 +464,13 @@ namespace Akka.Persistence
         protected void Command(System.Action<object> handler) { }
         protected void CommandAny(System.Action<object> handler) { }
         protected void CommandAnyAsync(System.Func<object, System.Threading.Tasks.Task> handler) { }
-        protected void CommandAsync<[System.Runtime.CompilerServices.NullableAttribute(2)]  T>(System.Func<T, System.Threading.Tasks.Task> handler, System.Predicate<T> shouldHandle = null) { }
+        protected void CommandAsync<[System.Runtime.CompilerServices.NullableAttribute(2)]  T>(System.Func<T, System.Threading.Tasks.Task> handler, [System.Runtime.CompilerServices.NullableAttribute(new byte[] {
+                2,
+                1})] System.Predicate<T> shouldHandle = null) { }
         protected void CommandAsync<[System.Runtime.CompilerServices.NullableAttribute(2)]  T>(System.Predicate<T> shouldHandle, System.Func<T, System.Threading.Tasks.Task> handler) { }
-        protected void CommandAsync(System.Type messageType, System.Func<object, System.Threading.Tasks.Task> handler, System.Predicate<object> shouldHandle = null) { }
+        protected void CommandAsync(System.Type messageType, System.Func<object, System.Threading.Tasks.Task> handler, [System.Runtime.CompilerServices.NullableAttribute(new byte[] {
+                2,
+                1})] System.Predicate<object> shouldHandle = null) { }
         protected void CommandAsync(System.Type messageType, System.Predicate<object> shouldHandle, System.Func<object, System.Threading.Tasks.Task> handler) { }
         protected virtual void OnCommand(object message) { }
         protected virtual void OnRecover(object message) { }
@@ -495,9 +499,9 @@ namespace Akka.Persistence
         public long ReplayMax { get; }
         public long ToSequenceNr { get; }
     }
-    [System.Runtime.CompilerServices.NullableAttribute(0)]
     public sealed class RecoveryCompleted
     {
+        [System.Runtime.CompilerServices.NullableAttribute(1)]
         public static readonly Akka.Persistence.RecoveryCompleted Instance;
         public override bool Equals(object obj) { }
         public override int GetHashCode() { }
