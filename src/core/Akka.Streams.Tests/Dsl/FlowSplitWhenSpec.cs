@@ -79,11 +79,11 @@ namespace Akka.Streams.Tests.Dsl
             groupStream.Subscribe(masterSubscriber);
             var masterSubscription = await masterSubscriber.ExpectSubscriptionAsync();
 
-            run?.Invoke(masterSubscriber, masterSubscription, async () =>
+            await (run?.Invoke(masterSubscriber, masterSubscription, async () =>
             {
                 masterSubscription.Request(1);
                 return await masterSubscriber.ExpectNextAsync();
-            });
+            }) ?? Task.CompletedTask);
         }
 
         [Fact]
