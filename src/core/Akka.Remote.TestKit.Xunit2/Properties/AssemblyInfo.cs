@@ -19,15 +19,6 @@ using System.Runtime.InteropServices;
 [assembly: ComVisible(false)]
 
 // The following GUID is for the ID of the typelib if this project is exposed to COM
-[assembly: Guid("46ea9956-913f-4e65-9902-28a5edd9cdb3")]
+[assembly: Guid("de375180-0f6f-40c5-9dd4-3a27e2559d5d")]
+[assembly: InternalsVisibleTo("Akka.Remote.TestKit.Tests")]
 
-// Version information for an assembly consists of the following four values:
-//
-//      Major Version
-//      Minor Version 
-//      Build Number
-//      Revision
-//
-// You can specify all the values or you can default the Build and Revision Numbers 
-// by using the '*' as shown below:
-// [assembly: AssemblyVersion("1.0.*")]
