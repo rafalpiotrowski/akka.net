@@ -10,10 +10,9 @@ using System.Collections.Generic;
 using System.Threading.Tasks;
 using Akka.Actor;
 using Akka.TestKit;
-using Akka.TestKit.Xunit2.Attributes;
+using Akka.TestKit.Xunit.Attributes;
 using Akka.Util.Internal;
 using Xunit;
-using Xunit.Extensions;
 
 namespace Akka.Tests.Actor.Scheduler
 {
@@ -23,7 +22,9 @@ namespace Akka.Tests.Actor.Scheduler
         [LocalTheory(SkipLocal = "Tests that messages are sent with the specified interval, however due to inaccuracy " +
                                  "of Task.Delay this often fails. Run this especially if you've made changes to DedicatedThreadScheduler")]
         [InlineData(10, 1000)]
+#pragma warning disable xUnit1008 // LocalTheory implements ITheoryAttribute but analyzer doesn't recognize it
         public async Task ScheduleTellRepeatedly_in_milliseconds_Tests(int initialDelay, int interval)
+#pragma warning restore xUnit1008
         {
             // Prepare, set up actions to be fired
             IScheduler scheduler = new HashedWheelTimerScheduler(Sys.Settings.Config, Log);
