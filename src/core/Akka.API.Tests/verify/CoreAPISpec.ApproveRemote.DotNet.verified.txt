@@ -11,6 +11,7 @@
 [assembly: System.Runtime.CompilerServices.InternalsVisibleToAttribute("Akka.Remote.TestKit")]
 [assembly: System.Runtime.CompilerServices.InternalsVisibleToAttribute("Akka.Remote.TestKit.Tests")]
 [assembly: System.Runtime.CompilerServices.InternalsVisibleToAttribute("Akka.Remote.TestKit.Xunit2")]
+[assembly: System.Runtime.CompilerServices.InternalsVisibleToAttribute("Akka.Remote.TestKit.Xunit2.Tests")]
 [assembly: System.Runtime.CompilerServices.InternalsVisibleToAttribute("Akka.Remote.Tests")]
 [assembly: System.Runtime.CompilerServices.InternalsVisibleToAttribute("Akka.Remote.Tests.MultiNode")]
 [assembly: System.Runtime.CompilerServices.InternalsVisibleToAttribute("Akka.Remote.Tests.Performance")]
