@@ -104,8 +104,9 @@ Captured on `dev` branch (commit 467cbb510), .NET 10.0, Release, ServerGC, Linux
 
 ### Milestone 3.5: `widen-system-uid-to-64bit`
 
-**OpenSpec change**: `openspec/changes/widen-system-uid-to-64bit/`
+**OpenSpec change**: `openspec/changes/archive/2026-07-04-widen-system-uid-to-64bit/`
 **Depends on**: none (rolling-upgrade-safe). **Prerequisite for**: Milestone 4 (Artery).
+**Status**: DONE (2026-07-04) — merged via [#8317](https://github.com/akkadotnet/akka.net/pull/8317); all completion criteria met; change archived.
 
 **What it does**: Widens the address/system UID from 32-bit `int` to 64-bit `long` across Akka.Remote + Akka.Cluster (hard API break, v1.6), as a prerequisite for Artery's 64-bit frame UID. On the wire only `ClusterMessages.proto` `UniqueAddress.uid` widens (`uint32 → uint64`, varint-compatible for ≤32-bit values); handshake / RemoteWatcher heartbeat / DistributedData are already 64-bit. The CLR type is widened everywhere but value-generation is gated to int-range for rolling-upgrade safety.
 
