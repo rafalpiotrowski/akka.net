@@ -64,11 +64,16 @@ namespace Akka.Remote.Artery
     /// starve control traffic (design.md "Control stream before lanes" / Decision 5, and the
     /// Invariants section's "quarantine gating at the send-routing layer" / "control stream stays
     /// alive and drainable while quarantined"). Its capacity is intentionally smaller than the
-    /// ordinary queue's -- control traffic (handshake, heartbeat, quarantine notice) is low-volume
-    /// by nature. <b>GROUP7:</b> design.md Decision 7 calls for control/system overflow to
-    /// QUARANTINE (not drop) -- that full policy needs the reliable system-message layer (group 7)
-    /// to have something to quarantine FOR; at task group 6 a full control queue logs + dead-letters,
-    /// same as ordinary (see <c>ArteryRemoting.EnqueueControl</c>).
+    /// ordinary queue's -- control traffic (handshake, heartbeat, quarantine notice, and reliable
+    /// system-message envelopes) is low-volume relative to ordinary user traffic.
+    /// <b>GROUP7 RESOLVED (design.md gate G3):</b> design.md Decision 7's control/system overflow
+    /// -&gt; QUARANTINE policy is implemented in <c>ArteryRemoting.HandleControlOverflow</c> (called
+    /// from both <c>EnqueueControl</c> and <c>EnqueueSystemMessage</c> on a full channel) -- this is
+    /// a SEPARATE, much-smaller-capacity overflow point than <c>SystemMessageDeliveryStage</c>'s own
+    /// internal unacknowledged-buffer overflow (<c>system-message-buffer-size</c>, default 20000):
+    /// the channel here is producer-side backpressure (protects a producing actor thread from a slow
+    /// socket), while the stage's buffer is the RELIABILITY window (how long a sent-but-unacked
+    /// message may wait before giving up) -- both funnel into the same quarantine outcome.
     /// </para>
     /// </summary>
     internal sealed class Association
@@ -83,9 +88,10 @@ namespace Akka.Remote.Artery
         /// <summary>
         /// Default capacity for <see cref="ControlReader"/>'s bounded channel. Deliberately smaller
         /// than <see cref="DefaultOutboundQueueCapacity"/> -- control traffic (handshake, heartbeat,
-        /// quarantine notice) is low-volume by nature (design.md task group 6, task 6.1). The full
-        /// asymmetric overflow policy (control overflow -> quarantine, per Decision 7) is GROUP7
-        /// work; see the type-level remarks.
+        /// quarantine notice, reliable system-message envelopes and their Ack/Nack replies) is
+        /// low-volume relative to ordinary user traffic (design.md task group 6, task 6.1). The full
+        /// asymmetric overflow policy (control overflow -> quarantine, per Decision 7) is implemented
+        /// -- see the type-level "GROUP7 RESOLVED" remarks.
         /// </summary>
         public const int DefaultControlQueueCapacity = 256;
 
@@ -109,6 +115,24 @@ namespace Akka.Remote.Artery
         /// again in the future -- gets its own fresh unlogged state.
         /// </summary>
         private readonly ConcurrentDictionary<long, bool> _quarantineDropLogged = new();
+
+        /// <summary>
+        /// Same latch shape as <see cref="_quarantineDropLogged"/>, applied to the ORDINARY
+        /// outbound queue's overflow-drop warning (a flooded producer can otherwise log once PER
+        /// DROPPED MESSAGE -- thousands of formatted log lines during a burst -- which was itself
+        /// an amplifier of unrelated ThreadPool starvation observed under CI load). Keyed by uid
+        /// for the same reason: a reconnect (new incarnation) gets its own fresh unlogged state,
+        /// rather than a stale latch from a prior incarnation permanently silencing the warning.
+        /// Sends observed before the handshake resolves a peer uid all share the reserved
+        /// <see cref="PreHandshakeOverflowUid"/> bucket.
+        /// </summary>
+        private readonly ConcurrentDictionary<long, bool> _ordinaryOverflowDropLogged = new();
+
+        /// <summary>
+        /// Reserved uid bucket for <see cref="ShouldLogOrdinaryOverflowDrop"/> calls that occur
+        /// before this association's handshake has resolved a real peer uid.
+        /// </summary>
+        private const long PreHandshakeOverflowUid = long.MinValue;
 
         public Association(
             Address remoteAddress,
@@ -220,6 +244,17 @@ namespace Akka.Remote.Artery
         /// silent).
         /// </summary>
         public bool ShouldLogQuarantineDrop(long uid) => _quarantineDropLogged.TryAdd(uid, true);
+
+        /// <summary>
+        /// Records ("log once per association, not per message" -- same discipline as
+        /// <see cref="ShouldLogQuarantineDrop"/>) that an ORDINARY outbound queue overflow-drop
+        /// warning has been logged for <paramref name="uid"/> (or, pre-handshake, the reserved
+        /// <see cref="PreHandshakeOverflowUid"/> bucket). Returns <see langword="true"/> the FIRST
+        /// time it is called for a given uid (the caller should log), and <see langword="false"/>
+        /// every subsequent call for that same uid (the caller should stay silent and just drop).
+        /// </summary>
+        public bool ShouldLogOrdinaryOverflowDrop(long? uid) =>
+            _ordinaryOverflowDropLogged.TryAdd(uid ?? PreHandshakeOverflowUid, true);
 
         /// <summary>
         /// CAS loop applying <see cref="AssociationState.CompleteHandshake"/>. Returns both the
