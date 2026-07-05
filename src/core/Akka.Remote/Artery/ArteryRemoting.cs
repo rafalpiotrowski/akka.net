@@ -60,6 +60,20 @@ namespace Akka.Remote.Artery
         private AssociationRegistryInboundContext? _inboundContext;
 
         /// <summary>
+        /// The <see cref="ArrayPool{T}"/> every materialized outbound stream's
+        /// <see cref="ArteryEncodeStage"/> rents its encode buffers from -- sourced from
+        /// <see cref="ArteryTransportSetup.EncodeBufferPool"/> (read once in <see cref="Start"/>).
+        /// <see langword="null"/> (production default, and whenever no <see cref="ArteryTransportSetup"/>
+        /// is present at all) means <see cref="ArrayPool{T}.Shared"/> -- see
+        /// <see cref="ArteryEnvelopeCodec.Encode(Akka.Serialization.Serialization,long,string?,string?,object,ArrayPool{byte}?)"/>'s
+        /// own default. Replaces the former mutable static test hook (<c>EncodePoolOverrideForTests</c>)
+        /// -- see <see cref="ArteryTransportSetup"/> for why (per-<see cref="ExtendedActorSystem"/>
+        /// configuration, not a process-wide static, so concurrently-running tests never race
+        /// each other over it).
+        /// </summary>
+        private ArrayPool<byte>? _encodeBufferPool;
+
+        /// <summary>
         /// Initializes a new instance of the <see cref="ArteryRemoting"/> class.
         /// </summary>
         /// <param name="system">TBD</param>
@@ -88,6 +102,9 @@ namespace Akka.Remote.Artery
 
             _materializer = ActorMaterializer.Create(System);
             _tcp = System.TcpStream();
+            _encodeBufferPool = System.Settings.Setup.Get<ArteryTransportSetup>()
+                .Select(s => s.EncodeBufferPool)
+                .GetOrElse(null);
 
             // halfClose: true is essential here, not cosmetic. Every accepted (inbound) connection's
             // WRITE side is `Source.Empty` (Artery uses separate per-direction connections -- see the
@@ -207,7 +224,7 @@ namespace Akka.Remote.Artery
             var inboundSink = Flow.Create<ReadOnlySequence<byte>>()
                 .Via(new ArteryInboundProcessingStage(_settings.MaximumFrameSize, System.Serialization))
                 .Via(Flow.FromGraph(new InboundHandshakeStage(_inboundContext!)))
-                .To(Sink.ForEach<object>(DispatchInbound));
+                .To(Sink.ForEach<IInboundEnvelope>(DispatchInbound));
 
             // The accepted (inbound) connection is read-only at G2: Artery uses SEPARATE
             // per-direction connections, so any reply (starting with the HandshakeRsp) goes out over
@@ -216,13 +233,13 @@ namespace Akka.Remote.Artery
             connection.HandleWith(Flow.FromSinkAndSource(inboundSink, Source.Empty<ReadOnlySequence<byte>>()), _materializer!);
         }
 
-        private void DispatchInbound(object elem)
+        private void DispatchInbound(IInboundEnvelope env)
         {
-            if (elem is not ArteryInboundEnvelope env)
+            if (env.IsControl || env.RecipientPath is null)
             {
-                // InboundHandshakeStage swallows HandshakeReq/HandshakeRsp; nothing else is expected
-                // to reach this point.
-                _log.Warning("Dropping unexpected inbound Artery element of type [{0}]", elem?.GetType());
+                // InboundHandshakeStage swallows HandshakeReq/HandshakeRsp (and any other control
+                // envelope); nothing else is expected to reach this point.
+                _log.Warning("Dropping unexpected inbound Artery control envelope carrying [{0}]", env.Message.GetType());
                 return;
             }
 
@@ -245,7 +262,7 @@ namespace Akka.Remote.Artery
             if (!association.IsOutboundMaterialized)
                 association.EnsureOutboundMaterialized(a => MaterializeOutbound(remoteAddress, a));
 
-            if (!association.TryEnqueueOutbound(new ArteryOutboundElement(message, senderPath, recipientPath)))
+            if (!association.TryEnqueueOutbound(new OutboundEnvelope(message, senderPath, recipientPath)))
             {
                 _log.Warning(
                     "Outbound Artery queue to [{0}] is full (capacity {1}); dropping message of type [{2}] to dead letters.",
@@ -280,10 +297,11 @@ namespace Akka.Remote.Artery
             var port = remoteAddress.Port
                 ?? throw new RemoteTransportException($"Cannot open an Artery outbound connection to [{remoteAddress}]: missing port.");
 
+            var encodeStage = new ArteryEncodeStage(System.Serialization, _localUniqueAddress.Uid, _encodeBufferPool);
+
             var frames = ChannelSource.FromReader(association.OutboundReader)
-                .Select(elem => (object)elem)
                 .Via(Flow.FromGraph(handshakeStage))
-                .Select(EncodeOutboundElement);
+                .Via(Flow.FromGraph(encodeStage));
 
             var completion = Source.Single(BuildOrdinaryPreamble())
                 .Concat(frames)
@@ -300,29 +318,6 @@ namespace Akka.Remote.Artery
                 else
                     _log.Debug("Artery outbound connection to [{0}] completed.", remoteAddress);
             }, TaskContinuationOptions.ExecuteSynchronously);
-        }
-
-        private ReadOnlySequence<byte> EncodeOutboundElement(object elem)
-        {
-            object message = elem;
-            string? senderPath = null;
-            string? recipientPath = null;
-
-            if (elem is ArteryOutboundElement wrapped)
-            {
-                message = wrapped.Message;
-                senderPath = wrapped.SenderPath;
-                recipientPath = wrapped.RecipientPath;
-            }
-
-            // elem may also be a bare IArteryControlMessage (a HandshakeReq OutboundHandshakeStage
-            // injected itself) -- encoded identically, with both paths null/absent.
-            using var writer = ArteryEnvelopeCodec.Encode(System.Serialization, _localUniqueAddress.Uid, senderPath, recipientPath, message);
-
-            // Copy off the pooled buffer before disposing it -- the Tcp connection stage may not
-            // consume this element synchronously, so we cannot return the writer's own (rented, about
-            // to be returned to the pool) memory.
-            return new ReadOnlySequence<byte>(writer.WrittenSpan.ToArray());
         }
 
         private static ReadOnlySequence<byte> BuildOrdinaryPreamble()
