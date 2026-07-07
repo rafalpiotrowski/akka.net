@@ -188,6 +188,100 @@ Akka.NET's classic UID is a 32-bit `int` (`AddressUidExtension.Uid` → `int`; `
 
 **G2 correctness suite:** happy-path associate (UID both ways; `association(uid)` None→Some); traffic-stall buffering (pre-completion messages delivered in order, zero drops); timeout + retry cadence; incarnation change (new UID resets association, ordering preserved); quarantine (+ new-UID re-associate, stale-UID ignored, pruning); InboundHandshake guards (wrong `to`, unknown origin); **Cluster integration — `SelfUniqueAddress` UID == observed handshake UID (the test that pins the int/long decision)**; config switch + coexistence (mixed-transport fails fast).
 
+## Association outbound-stream lifecycle: reconnect (group 9, DESIGNED 2026-07-05)
+
+G2 shipped with a documented limitation: a failed outbound connection ended the association's
+stream permanently. That violates the verified `SendQueue` lifecycle invariant ("the queue is
+**externally owned and injected** … the queue **survives stream restart** — reconnect re-attaches
+a new consumer to the same queue, so buffered messages persist") and blocks every
+restart-with-new-UID scenario. Group 9 implements it:
+
+- **The channels already survive** (Association-owned; `CompleteOutbound` only fires at transport
+  shutdown). What restarts is the CONSUMER: on outbound-stream termination (connection refused,
+  reset, `HandshakeTimeoutException`, write failure), the association's materialize-once gate for
+  that stream RESETS, and re-materialization is scheduled after `outbound-restart-backoff` (new
+  `advanced` key, default 1s). Applies independently per stream (ordinary, control).
+- **Retry policy — MVP-simple, termination via existing mechanisms:** unlimited restarts with the
+  fixed backoff. There is deliberately NO restart-count give-up: the association's *reliability*
+  give-up already exists where it matters — `give-up-system-message-after` quarantines when
+  unacked system messages age out, and quarantine gates ordinary sends. An unreachable peer with
+  no pending system messages costs one bounded queue + one backoff timer — same cost class as
+  Pekko's idle associations. Buffered ordinary messages persist until delivery or process
+  shutdown (bounded at queue capacity; overflow policy unchanged).
+- **Handshake across restart is free:** the handshake stages are per-materialization; a fresh
+  stream re-injects `HandshakeReq`; the peer's reply is idempotent (`CompleteHandshake` same-uid
+  no-op) or installs a new incarnation (peer restarted with new UID) — exactly the G2 semantics.
+  System-message seqNo state is per-incarnation and lives OUTSIDE the stage materialization
+  (delivery-stage buffer must survive restart or re-send from the buffer on re-materialization —
+  implementation must preserve invariant: no unacked system message is lost by a stream restart).
+- **Quarantined associations still restart their CONTROL stream** (piercing requires a live
+  control channel); ordinary remains gated at `Send()`.
+- **Inbound requires nothing:** new inbound connections are accepted at any time; acker state is
+  per-connection/incarnation by construction.
+- **Config:** `advanced.outbound-restart-backoff = 1s`. Tests use progress/order assertions only.
+
+**Group 9 correctness suite:** kill the peer's listener mid-traffic → restart it (same address,
+NEW uid) → association re-associates, new incarnation installed, old uid stays quarantinable,
+buffered messages from the old incarnation are NOT delivered out of order (**PINNED, implemented
+2026-07-06**: an ordinary envelope still sitting in the association-owned outbound channel — i.e.
+not yet dequeued by a consumer — at the moment the old stream dies is neither dropped nor
+reordered: it stays queued and is delivered, in original per-recipient order, to the new
+incarnation once the fresh handshake completes. The ONLY messages that may be lost are ones
+already dequeued from the channel and handed to a materialization that itself fails again before
+completing its OWN handshake — an accepted, pre-existing best-effort characteristic of the
+ordinary stream (it has no ack/resend, unlike the reliable system-message lane), not a new gap
+introduced by reconnect. This required two implementation fixes beyond simple gate-reset-and-retry:
+(1) `OutboundHandshakeStage`'s G2-era "already associated by address ⇒ skip re-handshake" fast path
+is unsafe across a restart — it must be forced through a fresh `HandshakeReq` round trip
+(`ForceReqOnStart`, gated on a monotonic per-association `HandshakeGeneration` counter, since a
+same-uid re-handshake is a no-op on `AssociationState` and provides no other observable signal);
+(2) `Akka.IO.TcpConnection` never proactively observed its write pump's completion, so a write-side
+I/O failure on an otherwise-idle one-way connection could go undetected indefinitely — fixed
+generally (not Artery-specific) by mirroring the existing read-pump-monitoring pattern);
+(3) **the ordinary stream has no keep-alive, so it detects a dead peer only when an ordinary write
+happens to fail — and a single write to a just-gracefully-closed socket can succeed locally (the
+peer's RST lands only afterwards), leaving an idle ordinary stream stranded on a dead connection
+indefinitely** (observed as a slow-CI-only 30s hang in the queued-redelivery spec, deterministic
+on fast boxes only because loopback RST latency there wins the race). Fixed by having the CONTROL
+stream — which detects the same death RELIABLY, since its periodic heartbeat always produces a
+"second write" that hits the errored socket — trip a published per-materialization ordinary
+`UniqueKillSwitch` (`Association._outboundKillSwitch`) when control's own connection genuinely fails,
+driving the ordinary stream down through the standard termination → `ScheduleOutboundRestart` path
+so it reconnects to the live incarnation alongside control instead of lingering. The trip is
+**edge-triggered — once per death, not per control fault**: control captures its `OutgoingConnection`
+materialized task and arms the detector (`MarkControlHealthy`) only when the connection is actually
+ESTABLISHED (a connection-refused reconnect attempt against a still-dead peer faults that task and
+leaves it disarmed), and the fault path fires the trip only via `TryConsumeControlHealthy()`
+(atomic read-and-clear). Without the edge gate, control's ~per-backoff reconnect-loop faults would
+each re-trip the ordinary stream, and a trip landing while the ordinary consumer is mid-handshake
+against the revived peer would drop its single held `pendingMessage` — the accepted best-effort
+window, but needless churn that empirically dropped the first buffered message ~50% of the time
+under a 2-core load. With the edge gate the ordinary stream is kicked exactly once (initial death),
+then self-manages its own reconnect loop and delivers its still-queued messages in order,
+uninterrupted, once the peer returns. Read-side EOF cannot substitute (it fires on every healthy
+one-way connection, so it was deliberately rejected as the teardown trigger); adding an ordinary
+keep-alive was rejected in favour of reusing control's existing reliable detection. Non-lossy for
+the pinned invariant above (a spurious trip during a control-only transient costs only a cheap
+ordinary reconnect; only already-dequeued envelopes are at-most-once-dropped, queued ones survive).
+
+**Test split (channel-buffering unit-tested; end-to-end proves ORDER).** The precise "messages
+still in the channel survive a stream restart" property is asserted deterministically at the unit
+level in `AssociationRestartSpec` (gate/killswitch/channel logic, no real sockets). The end-to-end
+`ArteryReconnectSpec.Should_Redeliver_Queued_Ordinary_Messages_After_Reconnect` proves the
+observable half — after the peer restarts under a new uid, a burst of ordinary messages to the same
+path is delivered to the new incarnation **in original order** (a contiguous in-order suffix; k==0
+== all delivered in the common case). It confirms reconnect by retrying a throwaway probe until one
+round-trips, NOT by observing the exact moment the dead-peer stream tears down: that internal
+transition's observability is subject to OS socket-close timing (a lone write to a
+gracefully-closed socket can succeed locally, so a busy Windows agent may not surface the dead
+connection until after the reconnect to the live one has already happened — which made an earlier
+`!IsOutboundMaterialized` gate wait flaky on Windows while the reconnect itself worked fine, as the
+sibling `Should_Reassociate` spec independently proves on the same platform). DeathWatch
+across peer restart (watch → peer dies → Terminated via give-up/quarantine path); clean start/stop
+cycles (9.2); QuarantinedEvent publication (9.4); cluster formation over Artery (9.5 — first full
+integration proof; `akka://` scheme in seed nodes — verified working with the production
+seed-nodes join path, no changes needed).
+
 ## Reliable system-message delivery (gate G3)
 
 Verified against Pekko `SystemMessageDelivery.scala` + Akka.NET `AckedDelivery.cs` / `Endpoint.cs`.

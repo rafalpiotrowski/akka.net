@@ -13,6 +13,7 @@ using System.Collections.Concurrent;
 using System.Threading;
 using System.Threading.Channels;
 using Akka.Actor;
+using Akka.Streams;
 
 namespace Akka.Remote.Artery
 {
@@ -28,6 +29,7 @@ namespace Akka.Remote.Artery
     internal sealed class MaterializeOnceGate
     {
         private int _started;
+        private volatile bool _hasEverRestarted;
 
         /// <summary>
         /// Whether <see cref="EnsureStarted"/> has already started (or finished) materializing.
@@ -37,6 +39,20 @@ namespace Akka.Remote.Artery
         public bool IsStarted => Volatile.Read(ref _started) != 0;
 
         /// <summary>
+        /// Whether <see cref="Reset"/> has EVER been called on this gate -- i.e. whether the
+        /// stream this gate guards has restarted (design.md group 9) at least once. Sticky for
+        /// the gate's whole lifetime (never cleared back to <see langword="false"/>): once a
+        /// stream has restarted even once, EVERY subsequent materialization -- regardless of
+        /// which caller's <see cref="EnsureStarted"/> call happens to win the race to actually
+        /// run it (the scheduled restart callback in <c>ArteryRemoting.ScheduleOutboundRestart</c>,
+        /// or an ordinary producer's on-demand <c>EnsureOutboundMaterialized</c> call arriving in
+        /// the same window) -- must be treated as a reconnect for handshake-safety purposes (see
+        /// <see cref="OutboundHandshakeStage.ForceReqOnStart"/>'s remarks): the peer on the other
+        /// end of ANY given materialization from here on could have restarted under a new uid.
+        /// </summary>
+        public bool HasEverRestarted => _hasEverRestarted;
+
+        /// <summary>
         /// Runs <paramref name="materialize"/> exactly once, no matter how many threads call this
         /// concurrently -- only the FIRST caller's callback executes (CAS-gated on an internal flag).
         /// </summary>
@@ -44,6 +60,21 @@ namespace Akka.Remote.Artery
         {
             if (Interlocked.CompareExchange(ref _started, 1, 0) == 0)
                 materialize();
+        }
+
+        /// <summary>
+        /// Resets the latch so the NEXT <see cref="EnsureStarted"/> call materializes again --
+        /// design.md group 9, "Association outbound-stream lifecycle: reconnect": called once an
+        /// outbound stream's completion is observed, so re-materialization can be scheduled after
+        /// <c>outbound-restart-backoff</c>. Not CAS-guarded: by construction, only the single
+        /// completion continuation for the stream this gate belongs to ever calls this (stream
+        /// materializations for a given gate are strictly sequential -- the gate itself is what
+        /// prevents two from ever running concurrently). Also latches <see cref="HasEverRestarted"/>.
+        /// </summary>
+        public void Reset()
+        {
+            _hasEverRestarted = true;
+            Volatile.Write(ref _started, 0);
         }
     }
 
@@ -107,6 +138,81 @@ namespace Akka.Remote.Artery
         private readonly Channel<IOutboundEnvelope> _controlChannel;
         private readonly MaterializeOnceGate _outboundGate = new();
         private readonly MaterializeOnceGate _controlGate = new();
+
+        /// <summary>
+        /// The <see cref="UniqueKillSwitch"/> of the CURRENT materialization of this association's
+        /// ORDINARY outbound stream (design.md group 9, canonical reconnect fix), or
+        /// <see langword="null"/> if that stream has never been materialized. Published by
+        /// <see cref="SetOutboundKillSwitch"/> on the materializing thread; read + tripped by
+        /// <see cref="TripOutboundKillSwitch"/> from the CONTROL stream's termination continuation
+        /// on a different thread -- <c>volatile</c> for that cross-thread visibility (a reference
+        /// write/read is already atomic).
+        ///
+        /// <para>
+        /// <b>Why the control stream trips it.</b> The ordinary stream has no keep-alive, so it
+        /// detects a dead peer only when an ordinary write happens to fail -- and a single write to
+        /// a just-gracefully-closed socket can succeed locally (the peer's RST lands only
+        /// afterwards), leaving an idle ordinary stream stranded on a dead connection indefinitely.
+        /// The CONTROL stream detects the same peer death RELIABLY -- its periodic heartbeat always
+        /// produces a "second write" that hits the errored socket -- so when control's own
+        /// connection genuinely fails we trip this switch to drive the ordinary stream down too, so
+        /// it reconnects to the live incarnation alongside control instead of lingering. Tripping is
+        /// idempotent (<see cref="UniqueKillSwitch.Shutdown"/>) and null-safe; a stale switch
+        /// (ordinary already torn down / in restart-backoff) is a harmless no-op.
+        /// </para>
+        ///
+        /// <para>
+        /// <b>Edge-triggered, once per death (<see cref="MarkControlHealthy"/>/<see cref="TryConsumeControlHealthy"/>).</b>
+        /// The trip fires only on control's transition from CONNECTED to FAILED -- NOT on every
+        /// control-stream fault. Control reconnect-loops against a still-dead peer (each attempt is a
+        /// fast connection-refused fault), and tripping the ordinary stream on each of those would
+        /// churn it: a trip landing while the ordinary consumer is mid-handshake against the revived
+        /// peer would drop its single held <c>pendingMessage</c> (accepted at-most-once, but
+        /// needless). So the trip is gated on <see cref="TryConsumeControlHealthy"/>: it fires once
+        /// for the initial death (control HAD connected -- warmup, or a prior incarnation), then goes
+        /// quiet until control successfully connects again (<see cref="MarkControlHealthy"/>). After
+        /// that single kick the ordinary stream self-manages its own reconnect loop and, once the
+        /// peer is back, delivers its still-queued messages in order UNINTERRUPTED. Non-lossy for
+        /// pinned invariant 5: anything still in the association-owned channel survives (the channel
+        /// is externally owned and outlives any single materialization).
+        /// </para>
+        /// </summary>
+        private volatile UniqueKillSwitch? _outboundKillSwitch;
+
+        /// <summary>
+        /// Edge-detector state for <see cref="_outboundKillSwitch"/>'s once-per-death tripping. Set
+        /// to 1 by <see cref="MarkControlHealthy"/> when the CONTROL stream's outbound connection is
+        /// successfully ESTABLISHED (its <c>OutgoingConnection</c> materialized task completes -- a
+        /// connection-refused reconnect attempt against a dead peer FAULTS that task instead, so it
+        /// never marks healthy); atomically read-and-cleared to 0 by <see cref="TryConsumeControlHealthy"/>
+        /// on the control stream's fault, which trips the ordinary stream only if control had in fact
+        /// been connected since the last trip. <see cref="Interlocked"/> throughout -- written on the
+        /// connection-established continuation, consumed on the termination continuation, different
+        /// threads.
+        /// </summary>
+        private int _controlHealthy;
+
+        /// <summary>
+        /// Set (independently per stream) by <see cref="CompleteOutbound"/>/<see cref="CompleteControlOutbound"/>
+        /// -- design.md group 9's restart guard: "no restart after transport <c>Shutdown()</c>".
+        /// <see cref="ArteryRemoting.Shutdown"/> is the only production caller of either
+        /// <c>Complete*Outbound</c> method, so observing either flag set means this association's
+        /// stream was deliberately torn down for good, and the outbound-stream-termination
+        /// continuation must not schedule a restart for it.
+        /// </summary>
+        private volatile bool _outboundShutDown;
+        private volatile bool _controlShutDown;
+
+        /// <summary>
+        /// Association-owned state for the OUTBOUND half of reliable system-message delivery
+        /// (design.md gate G3's <see cref="SystemMessageDeliveryStage"/>, extended by design.md
+        /// group 9's reconnect invariant 3: "no unacked system message may be lost across a
+        /// restart"). Deliberately NOT owned by the stage's per-materialization
+        /// <c>GraphStageLogic</c> -- a fresh materialization (stream restart) attaches to this
+        /// SAME instance instead of starting from an empty buffer, so in-flight unacknowledged
+        /// system messages survive the restart. See <see cref="SystemMessageDeliveryState"/>.
+        /// </summary>
+        private readonly SystemMessageDeliveryState _systemMessageDeliveryState = new();
 
         /// <summary>
         /// Per-uid "have we already logged a quarantine-drop for this uid" latch (task 6.6:
@@ -193,6 +299,110 @@ namespace Akka.Remote.Artery
         public bool IsControlOutboundMaterialized => _controlGate.IsStarted;
 
         /// <summary>
+        /// Whether the ORDINARY outbound stream has EVER restarted (design.md group 9) -- see
+        /// <see cref="MaterializeOnceGate.HasEverRestarted"/>. Every caller that materializes this
+        /// stream (whether <c>ArteryRemoting.ScheduleOutboundRestart</c>'s scheduled callback, or
+        /// an ordinary producer's own on-demand <c>EnsureOutboundMaterialized</c> call racing it)
+        /// consults this at the moment its callback actually runs, so whichever one wins gets the
+        /// SAME correct answer -- see <c>ArteryRemoting.MaterializeOutboundStream</c>'s
+        /// <c>isRestart</c> parameter.
+        /// </summary>
+        public bool HasOutboundEverRestarted => _outboundGate.HasEverRestarted;
+
+        /// <summary>
+        /// Whether the CONTROL outbound stream has EVER restarted. See <see cref="HasOutboundEverRestarted"/>.
+        /// </summary>
+        public bool HasControlEverRestarted => _controlGate.HasEverRestarted;
+
+        /// <summary>
+        /// Association-owned state backing <see cref="SystemMessageDeliveryStage"/>'s outbound
+        /// unacknowledged buffer/seqNo/incarnation tracking -- see the type-level remarks on
+        /// <see cref="_systemMessageDeliveryState"/>.
+        /// </summary>
+        public SystemMessageDeliveryState SystemMessageDeliveryState => _systemMessageDeliveryState;
+
+        /// <summary>
+        /// Whether this association's ORDINARY outbound stream has been permanently torn down by
+        /// <see cref="CompleteOutbound"/> (transport <see cref="ArteryRemoting.Shutdown"/>) -- design.md
+        /// group 9's restart guard.
+        /// </summary>
+        public bool IsOutboundShutDown => _outboundShutDown;
+
+        /// <summary>
+        /// Whether this association's CONTROL outbound stream has been permanently torn down by
+        /// <see cref="CompleteControlOutbound"/>. See <see cref="IsOutboundShutDown"/>.
+        /// </summary>
+        public bool IsControlShutDown => _controlShutDown;
+
+        /// <summary>
+        /// Resets the ORDINARY outbound stream's materialize-once gate (design.md group 9) so the
+        /// next <see cref="EnsureOutboundMaterialized"/> call re-materializes it.
+        /// </summary>
+        public void ResetOutboundGate() => _outboundGate.Reset();
+
+        /// <summary>
+        /// Resets the CONTROL outbound stream's materialize-once gate. See <see cref="ResetOutboundGate"/>.
+        /// </summary>
+        public void ResetControlGate() => _controlGate.Reset();
+
+        /// <summary>
+        /// Publishes the <see cref="UniqueKillSwitch"/> for the ORDINARY outbound stream's current
+        /// materialization so <see cref="TripOutboundKillSwitch"/> can later abort it. Called by the
+        /// transport (<c>ArteryRemoting.MaterializeOutboundStream</c>) each time the ordinary stream
+        /// is (re-)materialized -- see <see cref="_outboundKillSwitch"/>.
+        /// </summary>
+        public void SetOutboundKillSwitch(UniqueKillSwitch killSwitch) => _outboundKillSwitch = killSwitch;
+
+        /// <summary>
+        /// Drives the ORDINARY outbound stream's current materialization down (if any) via its
+        /// <see cref="UniqueKillSwitch"/>, so the standard termination -&gt;
+        /// <c>ArteryRemoting.ScheduleOutboundRestart</c> path reconnects it. Idempotent + null-safe.
+        /// Called from the CONTROL stream's termination continuation when control's connection
+        /// genuinely fails AND had previously connected (<see cref="TryConsumeControlHealthy"/>) --
+        /// see <see cref="_outboundKillSwitch"/> for why control's reliable death detection drives
+        /// the keep-alive-less ordinary stream, and why the trip is edge-triggered.
+        /// </summary>
+        public void TripOutboundKillSwitch() => _outboundKillSwitch?.Shutdown();
+
+        /// <summary>
+        /// Records that the CONTROL stream's outbound connection has been successfully ESTABLISHED,
+        /// arming the once-per-death ordinary-stream trip (see <see cref="_controlHealthy"/>). Called
+        /// from the transport when control's <c>OutgoingConnection</c> materialized task completes.
+        /// </summary>
+        public void MarkControlHealthy() => Interlocked.Exchange(ref _controlHealthy, 1);
+
+        /// <summary>
+        /// Atomically reports whether the CONTROL stream had connected since the last trip, clearing
+        /// the flag so a subsequent reconnect-loop fault (against a still-dead peer, which never
+        /// re-armed via <see cref="MarkControlHealthy"/>) does NOT trip the ordinary stream again.
+        /// See <see cref="_controlHealthy"/> / <see cref="_outboundKillSwitch"/>.
+        /// </summary>
+        public bool TryConsumeControlHealthy() => Interlocked.Exchange(ref _controlHealthy, 0) == 1;
+
+        /// <summary>
+        /// Whether the ORDINARY outbound stream should be (re-)materialized right now (design.md
+        /// group 9): <see langword="false"/> once this stream has been shut down for good
+        /// (<see cref="IsOutboundShutDown"/>), OR while the CURRENT peer uid is quarantined --
+        /// <see cref="RemoteTransport.Send"/> already gates every ordinary send for a quarantined
+        /// uid, so reconnecting the ordinary stream in that state would only waste a connection
+        /// (design.md: "ordinary remains gated at Send()"). A stale-uid quarantine (a PRIOR,
+        /// superseded incarnation) does not count -- only the CURRENT uid's quarantine status
+        /// matters, so a genuinely new incarnation (a different, non-quarantined uid) is free to
+        /// reconnect normally.
+        /// </summary>
+        public bool ShouldRestartOutbound() =>
+            !_outboundShutDown && !(CurrentState.UniqueRemoteAddress is { } peer && IsQuarantined(peer.Uid));
+
+        /// <summary>
+        /// Whether the CONTROL outbound stream should be (re-)materialized right now. Unlike
+        /// <see cref="ShouldRestartOutbound"/>, quarantine status is irrelevant here -- the
+        /// control stream restarts regardless of quarantine (design.md: "quarantined associations
+        /// still restart their CONTROL stream -- piercing requires a live control channel"). The
+        /// only thing that ever permanently stops it is this stream's own shutdown.
+        /// </summary>
+        public bool ShouldRestartControl() => !_controlShutDown;
+
+        /// <summary>
         /// Attempts to enqueue <paramref name="element"/> for the ORDINARY outbound stream to send.
         /// Non-blocking (<see cref="ChannelWriter{T}.TryWrite"/>) -- NEVER awaits/blocks a producing
         /// actor thread on a slow remote (Decision 7). Returns <see langword="false"/> when the
@@ -244,14 +454,24 @@ namespace Akka.Remote.Artery
         /// <summary>
         /// Marks the ORDINARY outbound channel complete (no further writes accepted) so its
         /// materialized <see cref="Akka.Streams.Dsl.ChannelSource.FromReader{T}"/> consumer
-        /// finishes gracefully. Called on transport shutdown.
+        /// finishes gracefully. Called on transport shutdown -- also latches
+        /// <see cref="IsOutboundShutDown"/> so design.md group 9's reconnect logic never
+        /// re-materializes this stream again.
         /// </summary>
-        public void CompleteOutbound() => _outboundChannel.Writer.TryComplete();
+        public void CompleteOutbound()
+        {
+            _outboundChannel.Writer.TryComplete();
+            _outboundShutDown = true;
+        }
 
         /// <summary>
         /// Marks the CONTROL outbound channel complete. See <see cref="CompleteOutbound"/>.
         /// </summary>
-        public void CompleteControlOutbound() => _controlChannel.Writer.TryComplete();
+        public void CompleteControlOutbound()
+        {
+            _controlChannel.Writer.TryComplete();
+            _controlShutDown = true;
+        }
 
         /// <summary>
         /// Records (task 6.6: "log once per association, not per message") that a quarantine-drop
@@ -274,6 +494,23 @@ namespace Akka.Remote.Artery
             _ordinaryOverflowDropLogged.TryAdd(uid ?? PreHandshakeOverflowUid, true);
 
         /// <summary>
+        /// Monotonically incremented on EVERY <see cref="CompleteHandshake"/> call, regardless of
+        /// whether it actually changed <see cref="AssociationState"/> (a same-uid
+        /// <see cref="HandshakeRsp"/> is a documented, reference-equal no-op on
+        /// <see cref="Artery.AssociationState.CompleteHandshake"/> -- see that method's remarks and
+        /// <c>AssociationStateSpec</c>'s idempotency test, both left INTENTIONALLY unchanged here).
+        /// Exists purely so <see cref="OutboundHandshakeStage"/>'s <c>ForceReqOnStart</c> path
+        /// (design.md group 9) can detect "a fresh handshake round-trip was processed since MY
+        /// materialization started" even in the same-uid case, where <see cref="AssociationState"/>
+        /// itself provides no observable signal at all (see <see cref="IOutboundContext.HandshakeGeneration"/>'s
+        /// remarks for the full rationale).
+        /// </summary>
+        private long _handshakeGeneration;
+
+        /// <summary>See <see cref="_handshakeGeneration"/>.</summary>
+        public long HandshakeGeneration => Interlocked.Read(ref _handshakeGeneration);
+
+        /// <summary>
         /// CAS loop applying <see cref="AssociationState.CompleteHandshake"/>. Returns both the
         /// snapshot immediately before this call's effective transition and the resulting
         /// snapshot, so <see cref="AssociationRegistry"/> can tell — without a separate,
@@ -281,6 +518,8 @@ namespace Akka.Remote.Artery
         /// </summary>
         public (AssociationState Previous, AssociationState Updated) CompleteHandshake(UniqueAddress peer)
         {
+            Interlocked.Increment(ref _handshakeGeneration);
+
             while (true)
             {
                 var current = _state;
