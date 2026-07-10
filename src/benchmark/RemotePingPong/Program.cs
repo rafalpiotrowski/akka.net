@@ -10,11 +10,14 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
+using System.Net;
+using System.Net.Sockets;
 using System.Runtime;
 using System.Threading;
 using System.Threading.Tasks;
 using Akka.Actor;
 using Akka.Configuration;
+using Akka.Event;
 using Akka.Util.Internal;
 
 namespace RemotePingPong
@@ -75,6 +78,139 @@ namespace RemotePingPong
         // push the run into multi-second territory without touching the constant.
         private static long? _msgsOverride;
 
+        // Default akka.remote.artery.advanced.outbound-message-queue-size (see Remote.conf /
+        // AssociationRegistry.DefaultOutboundQueueCapacity) - the per-association capacity every
+        // benchmark client's outbound traffic funnels through when running in Artery mode.
+        private const int DefaultOutboundQueueCapacity = 3072;
+
+        // When set (via the "qsize=N" command-line token), overrides
+        // akka.remote.artery.advanced.outbound-message-queue-size (default 3072, see
+        // DefaultOutboundQueueCapacity) for both ActorSystems. Only meaningful in Artery mode.
+        // Plain integer - the underlying HOCON key is read with GetInt, not GetByteSize, so
+        // (unlike iobuf=) there's no k/m size-suffix parsing to mirror here.
+        private static int? _qSizeOverride;
+
+        // Resolved once (in Main(), from _qSizeOverride/_windowSize/_pinnedClients) before the run
+        // starts and applied uniformly to every ActorSystem created for the whole invocation - see
+        // ResolveQueueSize(). Null means "leave akka.remote.artery.advanced.outbound-message-queue-
+        // size at its HOCON default": no new HOCON key is set at all, so default-config runs (e.g.
+        // window=50 x clients=25) are byte-for-byte identical to pre-qsize behavior and stay
+        // historically comparable.
+        private static int? _effectiveQueueSize;
+
+        // Set alongside _effectiveQueueSize when the harness auto-raised the queue (as opposed to
+        // the caller passing an explicit qsize=); printed verbatim in the run header so an
+        // auto-raised run is never mistaken for a default-config one.
+        private static string? _queueSizeAutoRaiseReason;
+
+        // Split two-process mode (via the "server" / "client" command-line tokens): runs the two
+        // sides of the benchmark in separate processes so they can sit on two physical machines and
+        // exercise a real network. Both default to false, in which case the benchmark behaves
+        // exactly as before - both ActorSystems in this one process over loopback, byte-for-byte
+        // identical config. Split mode supports either transport, selected by the exact same
+        // "artery" token rule as single-process mode (see _useArtery) - neither token forces a
+        // transport on its own.
+        private static bool _serverMode;
+        private static bool _clientMode;
+
+        // "host=" - in server mode, the address this process advertises to clients (required).
+        // NOTE: neither transport's config sets a separate bind hostname here - ArterySettings'
+        // canonical.hostname and DotNetty's public-hostname both fall back to the bind hostname
+        // when left unset (see CreateActorSystemConfig) - so the listener binds directly to this
+        // address as well (bind == advertise) regardless of transport - use the machine's LAN IP,
+        // not 0.0.0.0. In client mode, the server's advertised address to benchmark against
+        // (required) - it must match the server's host= EXACTLY, since the string is part of the
+        // association key both sides agree on.
+        private static string? _host;
+
+        // "port=" - in server mode, the port the transport's listener binds/advertises; in client
+        // mode, the server's port. Defaults to DefaultSplitPort on both sides, so omitting it
+        // everywhere Just Works. (The client's OWN system always binds an ephemeral port - see
+        // Benchmark().)
+        private static int _splitPort = DefaultSplitPort;
+
+        // Matches ArterySettings' canonical.port default (which is also Pekko Artery's default).
+        // Used uniformly for split mode regardless of transport - DotNetty's own historical
+        // default is 2552 - so split-mode command lines are identical across transports; only
+        // the "artery" token changes.
+        private const int DefaultSplitPort = 25520;
+
+        // "myhost=" (client mode only) - the address the CLIENT's own remote system advertises.
+        // Server->client replies matter in both modes (echo replies in ping-pong, Ack/Complete
+        // credit grants in one-way), so this must be reachable FROM the server - never localhost
+        // when the server is a remote machine. Defaults to auto-detecting the local outbound IP
+        // toward the server via the connected-UDP-socket trick (see DetectLocalOutboundIp).
+        private static string? _myHost;
+
+        // True when _myHost came from DetectLocalOutboundIp rather than an explicit "myhost=" -
+        // disclosed in the client header so a mis-detected address is easy to spot and override.
+        private static bool _myHostAutoDetected;
+
+        // The wire scheme for whichever transport this run selected: "akka" for Artery
+        // (RemoteSettings.AkkaScheme, unwrapped) or "akka.tcp" for classic DotNetty remoting
+        // (RemoteSettings.AkkaScheme + TcpTransport's SchemeIdentifier, joined by
+        // SchemeAugmenter). Split-client mode has to build the server's Address by hand (see
+        // Benchmark()) since there's no local Provider.DefaultAddress to read it from, so this
+        // has to track _useArtery exactly, or RemoteScope deployment can't resolve the
+        // association at all. Single-process mode never needs this - it always reads the scheme
+        // straight off the real Provider.DefaultAddress.
+        private static string SplitServerScheme => _useArtery ? "akka" : "akka.tcp";
+
+        /// <summary>
+        /// Auto-detects the local IP the OS would use to reach <paramref name="serverHost"/>: the
+        /// connected-UDP-socket trick. UDP "connect" sends no packets - it only asks the kernel's
+        /// routing table which local interface/address the route to the server resolves to - so
+        /// this works without the server being up yet and picks the right interface on multi-homed
+        /// boxes. (Toward a loopback server it legitimately yields 127.0.0.1, which IS reachable
+        /// from a loopback server - the thing this avoids is advertising localhost to a REMOTE
+        /// server, where replies would then dead-end.)
+        /// </summary>
+        private static string DetectLocalOutboundIp(string serverHost, int serverPort)
+        {
+            using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            socket.Connect(serverHost, serverPort);
+            return ((IPEndPoint)socket.LocalEndPoint!).Address.ToString();
+        }
+
+        /// <summary>
+        /// Resolves the effective akka.remote.artery.advanced.outbound-message-queue-size for this
+        /// entire invocation. An explicit "qsize=" always wins. Otherwise, if windowSize times the
+        /// largest client count this run will exercise (the pinned "clients=" value, or the max of
+        /// GetClientSettings() when sweeping) would exceed 80% of the default 3072 capacity, the
+        /// queue is auto-raised to 2x that product - covers both the one-way credit-window case and
+        /// ping-pong's echo traffic, which both funnel through the same per-association outbound
+        /// queue. Left null (HOCON untouched) otherwise, so default-config runs never change.
+        /// </summary>
+        private static void ResolveQueueSize()
+        {
+            if (!_useArtery)
+            {
+                // qsize=/auto-raise tune akka.remote.artery.advanced.outbound-message-queue-size,
+                // which DotNetty's transport never reads - CreateActorSystemConfig() only writes
+                // that HOCON key when _useArtery is true. Leave _effectiveQueueSize/
+                // _queueSizeAutoRaiseReason both null (never even computed) for a DotNetty run, so
+                // there's nothing to auto-raise; an explicit qsize= override is instead surfaced as
+                // a one-line "ignored" notice in the run header - see PrintSysInfo/PrintServerInfo.
+                return;
+            }
+
+            if (_qSizeOverride.HasValue)
+            {
+                _effectiveQueueSize = _qSizeOverride.Value;
+                return;
+            }
+
+            var effectiveClientCount = _pinnedClients ?? GetClientSettings().Max();
+            var product = (long)_windowSize * effectiveClientCount;
+            if (product > DefaultOutboundQueueCapacity * 0.8)
+            {
+                var raised = (int)Math.Min(int.MaxValue, product * 2);
+                _effectiveQueueSize = raised;
+                _queueSizeAutoRaiseReason =
+                    $"outbound-message-queue-size auto-raised to {raised} (window x clients = {product} exceeds default {DefaultOutboundQueueCapacity})";
+            }
+        }
+
         public static Config CreateActorSystemConfig(string actorSystemName, string ipOrHostname, int port)
         {
             var commonConfig = ConfigurationFactory.ParseString(@"
@@ -111,6 +247,19 @@ namespace RemotePingPong
                 config = ioBufConfig.WithFallback(config);
             }
 
+            // Only set this key when it's actually going to be read (Artery mode) AND the caller/
+            // auto-raise logic actually resolved an override - see ResolveQueueSize(). Leaving
+            // _effectiveQueueSize null means no HOCON key is added here at all, so default-config
+            // runs keep an identical config to pre-qsize behavior.
+            if (_useArtery && _effectiveQueueSize.HasValue)
+            {
+                var queueSizeConfig = ConfigurationFactory.ParseString($@"
+                akka.remote.artery.advanced {{
+                  outbound-message-queue-size = {_effectiveQueueSize.Value}
+                }}");
+                config = queueSizeConfig.WithFallback(config);
+            }
+
             return config;
         }
 
@@ -133,9 +282,36 @@ namespace RemotePingPong
             // akka.io.tcp.receive-buffer-size / send-buffer-size (e.g. "128k", "1m") for both
             // ActorSystems - default behavior (8k) is unchanged when omitted. "msgs=N" overrides the
             // per-client message count (default 100000) - default behavior is unchanged when omitted.
-            // e.g. `RemotePingPong 3 artery` or `RemotePingPong artery oneway window=1000 clients=10 iobuf=128k msgs=500000`.
+            // "qsize=N" overrides akka.remote.artery.advanced.outbound-message-queue-size (default
+            // 3072, Artery mode only) for both ActorSystems; when omitted, the harness auto-raises
+            // it whenever window x clients would exceed 80% of the default capacity - see
+            // ResolveQueueSize(). Default-config runs (window x clients well under that threshold)
+            // are unaffected either way.
+            // Split two-process mode: "server" makes this process a long-lived host - it
+            // binds/advertises host= (required) and port= (default 25520), prints "SERVER READY"
+            // once listening, and serves sequential benchmark runs until killed (Ctrl+C/SIGTERM);
+            // "client host=<server-ip> [port=N]" points the full existing benchmark protocol
+            // (timesToRun reps, echo/oneway, all tokens above) at that remote server instead of an
+            // in-process system2. "myhost=" (client only) sets the address this client advertises
+            // for server->client replies - defaults to auto-detecting the outbound IP toward the
+            // server. Transport selection follows the exact same "artery" token rule as
+            // single-process mode - present (either side) selects Artery.Tcp, absent selects
+            // classic DotNetty remoting; neither "server" nor "client" forces a transport on its
+            // own. qsize=/auto-raise remain Artery-only concepts either way - under DotNetty
+            // they're ignored (with a header notice) rather than silently doing nothing. The
+            // orchestrator is expected to pass MATCHING window=/clients=/qsize=/oneway/artery
+            // tokens to both sides (dumb and explicit - each side sizes and reports its own
+            // config; there is no negotiation protocol). When neither "server" nor "client" is
+            // passed, behavior is exactly the single-process benchmark described above.
+            // e.g. `RemotePingPong 3 artery` or `RemotePingPong artery oneway window=1000 clients=10 iobuf=128k msgs=500000 qsize=10000`
+            // or `RemotePingPong server host=10.0.0.5 oneway window=200 clients=25` (machine A, DotNetty)
+            //  + `RemotePingPong 3 client host=10.0.0.5 oneway window=200 clients=25` (machine B, DotNetty)
+            // or `RemotePingPong server host=10.0.0.5 artery oneway window=200 clients=25` (machine A, Artery)
+            //  + `RemotePingPong 3 artery client host=10.0.0.5 oneway window=200 clients=25` (machine B, Artery).
             _useArtery = args.Any(a => a.Equals("artery", StringComparison.OrdinalIgnoreCase));
             _onewayMode = args.Any(a => a.Equals("oneway", StringComparison.OrdinalIgnoreCase));
+            _serverMode = args.Any(a => a.Equals("server", StringComparison.OrdinalIgnoreCase));
+            _clientMode = args.Any(a => a.Equals("client", StringComparison.OrdinalIgnoreCase));
 
             var timesToRun = 1u;
             var timesToRunSet = false;
@@ -176,6 +352,71 @@ namespace RemotePingPong
                         _msgsOverride = msgs;
                     continue;
                 }
+
+                if (a.StartsWith("qsize=", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (int.TryParse(a.Substring("qsize=".Length), out var qsize))
+                        _qSizeOverride = qsize;
+                    continue;
+                }
+
+                if (a.StartsWith("host=", StringComparison.OrdinalIgnoreCase))
+                {
+                    var host = a.Substring("host=".Length);
+                    if (!string.IsNullOrWhiteSpace(host))
+                        _host = host;
+                    continue;
+                }
+
+                if (a.StartsWith("port=", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (int.TryParse(a.Substring("port=".Length), out var port))
+                        _splitPort = port;
+                    continue;
+                }
+
+                if (a.StartsWith("myhost=", StringComparison.OrdinalIgnoreCase))
+                {
+                    var myhost = a.Substring("myhost=".Length);
+                    if (!string.IsNullOrWhiteSpace(myhost))
+                        _myHost = myhost;
+                    continue;
+                }
+            }
+
+            if (_serverMode && _clientMode)
+            {
+                await Console.Error.WriteLineAsync("Cannot pass both 'server' and 'client' - pick one side per process.");
+                Environment.Exit(1);
+            }
+
+            if (_serverMode || _clientMode)
+            {
+                // Transport was already selected above from the "artery" token, exactly like
+                // single-process mode - CreateActorSystemConfig() branches on _useArtery either
+                // way, so both server and client bind/advertise correctly for whichever transport
+                // was chosen. No forcing here.
+                if (string.IsNullOrEmpty(_host))
+                {
+                    await Console.Error.WriteLineAsync(_serverMode
+                        ? "'server' mode requires host=<address to advertise/bind> (use this machine's LAN IP)."
+                        : "'client' mode requires host=<server address> (must match the server's host= exactly).");
+                    Environment.Exit(1);
+                }
+
+                if (_clientMode && string.IsNullOrEmpty(_myHost))
+                {
+                    _myHost = DetectLocalOutboundIp(_host!, _splitPort);
+                    _myHostAutoDetected = true;
+                }
+            }
+
+            ResolveQueueSize();
+
+            if (_serverMode)
+            {
+                await RunServer();
+                return;
             }
 
             await Start(timesToRun);
@@ -213,6 +454,38 @@ namespace RemotePingPong
             {
                 Console.WriteLine("IO buffer size (akka.io.tcp):      {0}", _ioBufSize);
             }
+            if (_useArtery)
+            {
+                // Always print the effective value - default (untouched), explicit qsize=
+                // override, or auto-raised - so a run's queue capacity is never ambiguous from
+                // the header alone.
+                Console.WriteLine("Outbound queue size (artery):      {0}{1}", _effectiveQueueSize ?? DefaultOutboundQueueCapacity,
+                    _qSizeOverride.HasValue ? " (explicit qsize=)" : _effectiveQueueSize.HasValue ? " (auto-raised)" : " (default)");
+                if (_queueSizeAutoRaiseReason != null)
+                {
+                    var prevColor = Console.ForegroundColor;
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine(_queueSizeAutoRaiseReason);
+                    Console.ForegroundColor = prevColor;
+                }
+            }
+            else if (_qSizeOverride.HasValue)
+            {
+                // qsize= only means something in Artery mode (outbound-message-queue-size);
+                // called out explicitly rather than silently doing nothing, so a stray qsize= on a
+                // DotNetty run is never mistaken for having taken effect.
+                Console.WriteLine("qsize= ignored (DotNetty)");
+            }
+            if (_clientMode)
+            {
+                Console.WriteLine("Split mode:                        client -> {0}://SystemB@{1}:{2}", SplitServerScheme, _host, _splitPort);
+                Console.WriteLine("Client advertised address:         {0}{1}", _myHost, _myHostAutoDetected ? " (auto-detected)" : " (explicit myhost=)");
+                // Deliberate divergence from single-process mode, disclosed up front: the split
+                // server persists across all timesToRun reps (its JIT/caches stay warm) while this
+                // client recreates its system per rep - single-process mode restarts BOTH systems
+                // every rep, so split-mode rep-1 "cold" numbers warm up faster than historical ones.
+                Console.WriteLine("NOTE: server system persists across reps (server-side JIT stays warm); client recreates its system per rep.");
+            }
             Console.WriteLine();
 
             //Print tables
@@ -245,6 +518,102 @@ namespace RemotePingPong
             Console.WriteLine("Done..");
         }
 
+        /// <summary>
+        /// Split-mode server: a deliberately dumb, long-lived remote host - Artery or DotNetty,
+        /// whichever _useArtery selected (same "artery" token rule as single-process mode; see
+        /// CreateActorSystemConfig()). It creates NO benchmark actors of its own - every
+        /// echo/receiver actor is RemoteScope-deployed onto it by the client, via the exact same
+        /// deployments single-process mode makes against its in-process system2 (see Benchmark()).
+        /// Those land under /remote/[scheme]/SystemA@[myhost]:[ephemeral-port]/... paths on this
+        /// system ([scheme] being SplitServerScheme's "akka" or "akka.tcp"), and the client binds
+        /// a fresh ephemeral port every rep, so sequential runs can never collide on actor names -
+        /// Akka's remote-deployment daemon already IS a "server-side factory keyed by client
+        /// identity", which is why no run-id negotiation or receptionist protocol is needed here.
+        /// window=/clients=/qsize=/oneway tokens are accepted so the orchestrator can pass the
+        /// SAME values to both sides; functionally only the queue sizing matters on this side (it
+        /// sizes THIS system's outbound queue for the reply traffic - echoes in ping-pong,
+        /// Ack/Complete credit grants in one-way, and only in Artery mode - see
+        /// ResolveQueueSize()), while oneway/window/clients are disclosed in the header so
+        /// operators can eyeball that both sides were launched consistently. Serves an arbitrary
+        /// number of sequential benchmark runs until killed (Ctrl+C/SIGTERM).
+        /// </summary>
+        private static async Task RunServer()
+        {
+            var system = ActorSystem.Create("SystemB", CreateActorSystemConfig("SystemB", _host!, _splitPort));
+            // DefaultAddress reflects the ACTUALLY-bound endpoint (ActorSystem.Create doesn't
+            // return until the transport's listener is up), so printing READY from it is truthful.
+            var boundAddress = ((ExtendedActorSystem)system).Provider.DefaultAddress;
+
+            // Same drop visibility as Benchmark(), but long-lived: this process has no knowledge of
+            // client rep boundaries, so instead of one per-rep total it prints a SUSPECT delta line
+            // whenever new drops appeared since the last poll (below). Zero drops -> zero noise, so
+            // any SUSPECT line in a server log taints the client-side numbers from the same window.
+            var dropCounter = new DropCounter();
+            var dropWatcher = system.ActorOf(Props.Create(() => new DropCounterActor(dropCounter)), "dropWatcher");
+            system.EventStream.Subscribe(dropWatcher, typeof(Dropped));
+
+            Console.CancelKeyPress += (_, e) =>
+            {
+                e.Cancel = true; // shut the ActorSystem down instead of hard-killing the process
+                system.Terminate();
+            };
+
+            PrintServerInfo();
+            Console.WriteLine("SERVER READY on {0}:{1}", boundAddress.Host, boundAddress.Port);
+
+            var lastSeen = 0L;
+            while (!system.WhenTerminated.IsCompleted)
+            {
+                await Task.WhenAny(Task.Delay(TimeSpan.FromSeconds(5)), system.WhenTerminated);
+                var nowSeen = dropCounter.Count;
+                if (nowSeen > lastSeen)
+                {
+                    var prevColor = Console.ForegroundColor;
+                    Console.ForegroundColor = ConsoleColor.Magenta;
+                    Console.WriteLine("  *** SUSPECT: dropped {0} (outbound queue overflow, server side) ***", nowSeen - lastSeen);
+                    Console.ForegroundColor = prevColor;
+                }
+                lastSeen = nowSeen;
+            }
+        }
+
+        /// <summary>
+        /// Server-mode analogue of <see cref="PrintSysInfo"/>: discloses the tokens this side was
+        /// launched with, most importantly the effective outbound queue size. The values only match
+        /// the client's if the orchestrator passed the same window=/clients=/qsize= tokens to both
+        /// sides - keeping that the operator's job (dumb and explicit) is deliberate; there is no
+        /// negotiation protocol to go wrong.
+        /// </summary>
+        private static void PrintServerInfo()
+        {
+            Console.WriteLine("Transport:                         {0}", _useArtery ? "Artery.Tcp" : "DotNetty");
+            Console.WriteLine("Mode:                              {0} (split: server side)", _onewayMode ? "one-way" : "ping-pong");
+            Console.WriteLine("OSVersion:                         {0}", Environment.OSVersion);
+            Console.WriteLine("ProcessorCount:                    {0}", Environment.ProcessorCount);
+            Console.WriteLine("Is Server GC:                      {0}", GCSettings.IsServerGC);
+            Console.WriteLine("Window size (in-flight):           {0}", _windowSize);
+            if (_pinnedClients.HasValue)
+            {
+                Console.WriteLine("Pinned client count:               {0}", _pinnedClients.Value);
+            }
+            if (_useArtery)
+            {
+                Console.WriteLine("Outbound queue size (artery):      {0}{1}", _effectiveQueueSize ?? DefaultOutboundQueueCapacity,
+                    _qSizeOverride.HasValue ? " (explicit qsize=)" : _effectiveQueueSize.HasValue ? " (auto-raised)" : " (default)");
+                if (_queueSizeAutoRaiseReason != null)
+                {
+                    var prevColor = Console.ForegroundColor;
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine(_queueSizeAutoRaiseReason);
+                    Console.ForegroundColor = prevColor;
+                }
+            }
+            else if (_qSizeOverride.HasValue)
+            {
+                Console.WriteLine("qsize= ignored (DotNetty)");
+            }
+        }
+
         public static IEnumerable<int> GetClientSettings()
         {
             yield return 1;
@@ -269,27 +638,81 @@ namespace RemotePingPong
         private static async Task<(bool, long, int)> Benchmark(int numberOfClients, long numberOfRepeats, int windowSize, long bestThroughput, int redCount)
         {
             var totalMessagesReceived = GetTotalMessagesReceived(numberOfClients, numberOfRepeats);
-            var system1 = ActorSystem.Create("SystemA", CreateActorSystemConfig("SystemA", "127.0.0.1", 0));
+            // In split-client mode the local system advertises _myHost (which must be reachable
+            // FROM the server, since replies flow server->client in both modes); single-process
+            // mode keeps the historical loopback binding. Port 0 either way: a fresh OS-assigned
+            // port per rep, which split mode additionally relies on for server-side actor-path
+            // uniqueness (see the system2 comment below).
+            var system1 = ActorSystem.Create("SystemA", CreateActorSystemConfig("SystemA", _clientMode ? _myHost! : "127.0.0.1", 0));
 
-            var system2 = ActorSystem.Create("SystemB", CreateActorSystemConfig("SystemB", "127.0.0.1", 0));
+            // system2 - the serving side (echo actors in ping-pong, receivers in one-way) - only
+            // exists in this process in single-process mode. In split-client mode the serving side
+            // is a long-lived RunServer() process and system2Address simply points at it: all
+            // server-side actors are still created through the exact same RemoteScope deployments
+            // below, they just genuinely land on the other machine, under
+            // /remote/[scheme]/SystemA@[myhost]:[ephemeral-port]/... paths that are unique per rep
+            // (fresh client port each rep), so sequential runs never collide on the shared server.
+            // Deliberate divergence from single-process mode: that server persists across all
+            // timesToRun reps (its JIT stays warm) while system1 here is recreated per rep -
+            // single-process mode restarts BOTH systems every rep.
+            ActorSystem? system2 = null;
+            Address system2Address;
+            if (_clientMode)
+            {
+                // The split server has no local Provider.DefaultAddress to read here (it's a
+                // separate process) - its Address has to be built by hand, and the scheme MUST
+                // match the transport it was actually bound with (see SplitServerScheme) or
+                // RemoteScope deployment below can't resolve the association at all: classic
+                // DotNetty remoting addresses are "akka.tcp://...", Artery's are "akka://...".
+                system2Address = new Address(SplitServerScheme, "SystemB", _host, _splitPort);
+            }
+            else
+            {
+                system2 = ActorSystem.Create("SystemB", CreateActorSystemConfig("SystemB", "127.0.0.1", 0));
+                system2Address = ((ExtendedActorSystem)system2).Provider.DefaultAddress;
+            }
+
+            // Drop visibility: subscribe to the local systems' EventStream for Akka.Event.Dropped -
+            // ArteryRemoting.EnqueueOutbound publishes one directly to the EventStream (bypassing
+            // System.DeadLetters.Tell) every time an association's bounded outbound queue is full
+            // and a message is silently discarded (at-most-once delivery, by design). Those drops
+            // are otherwise invisible here: DeadLetterListener only logs its summary at INFO, and
+            // this harness hardcodes akka.loglevel=ERROR. This works regardless of loglevel because
+            // it's a direct EventStream subscription, not a log listener. Fresh counter/subscriber
+            // per rep (both are scoped to this Benchmark() call and torn down with the systems
+            // below), so drop counts never leak across reps or client-count sweeps. In split-client
+            // mode only system1 is watched from here - the server process runs its own watcher and
+            // prints its own SUSPECT lines to its own stdout, so BOTH sides' drops stay visible.
+            var dropCounter = new DropCounter();
+            var dropWatcher = system1.ActorOf(Props.Create(() => new DropCounterActor(dropCounter)), "dropWatcher");
+            system1.EventStream.Subscribe(dropWatcher, typeof(Dropped));
+            system2?.EventStream.Subscribe(dropWatcher, typeof(Dropped));
 
             List<Task<long>> tasks = new List<Task<long>>();
             // Holds the system1-side actor that needs the initial "go" nudge for each pair: the
             // BenchmarkActor client in ping-pong mode, or the OneWaySenderActor in one-way mode.
             List<IActorRef> primeTargets = new List<IActorRef>();
+            // The server-side (RemoteScope-deployed) actor of each pair: the echo in ping-pong,
+            // the receiver in one-way. Tracked so split-client mode can PoisonPill them after the
+            // rep - the split server is long-lived, so without this every rep would strand its
+            // idle actors there. (Single-process mode doesn't need it: system2.Terminate() below
+            // reaps everything, and skipping the extra wire traffic keeps default runs untouched.)
+            List<IActorRef> serverSideActors = new List<IActorRef>();
 
             var canStart = system1.ActorOf(Props.Create(() => new AllStartedActor()), "canStart");
-
-            var system1Address = ((ExtendedActorSystem)system1).Provider.DefaultAddress;
-            var system2Address = ((ExtendedActorSystem)system2).Provider.DefaultAddress;
 
             if (_onewayMode)
             {
                 // Credit-based flow control: unbounded fire-and-forget would overflow Artery's
-                // bounded outbound queue (capacity 3072/association) and silently starve, since
-                // there's no reply loop to naturally pace the sender. Capping in-flight credit at
-                // windowSize per pair bounds total unacked messages to clients*windowSize across the
-                // whole benchmark - callers are responsible for keeping that product under ~2500-3000.
+                // bounded outbound queue (default capacity 3072/association) and silently starve,
+                // since there's no reply loop to naturally pace the sender. Capping in-flight credit
+                // at windowSize per pair bounds total unacked messages to clients*windowSize across
+                // the whole benchmark. Callers no longer need to manually keep that product under
+                // ~2500-3000: ResolveQueueSize() auto-raises outbound-message-queue-size to 2x the
+                // product whenever it would exceed 80% of the default capacity (or callers can pin
+                // an explicit value via "qsize=") - see the field doc on _effectiveQueueSize. Drops
+                // (if the queue is ever undersized regardless) are surfaced via the dropWatcher
+                // subscription above rather than silently deadlocking the credit gate.
                 var ackEvery = Math.Max(1, windowSize / 2);
 
                 for (var i = 0; i < numberOfClients; i++)
@@ -316,6 +739,7 @@ namespace RemotePingPong
                             "sender" + i);
 
                     primeTargets.Add(sender);
+                    serverSideActors.Add(receiver);
 
                     canStart.Tell(receiver);
                     canStart.Tell(sender);
@@ -336,6 +760,7 @@ namespace RemotePingPong
                             "benchmark" + i);
 
                     primeTargets.Add(receiver);
+                    serverSideActors.Add(echo);
 
                     canStart.Tell(echo);
                     canStart.Tell(receiver);
@@ -379,8 +804,24 @@ namespace RemotePingPong
             
             var endThreads = Process.GetCurrentProcess().Threads.Count;
 
-            // force clean termination
-            await Task.WhenAll(new[] { system1.Terminate(), system2.Terminate() });
+            if (_clientMode)
+            {
+                // Tidy the long-lived split server between reps (see serverSideActors above).
+                // Post-measurement, so the extra wire traffic never lands inside the timed window.
+                serverSideActors.ForEach(a => a.Tell(PoisonPill.Instance));
+            }
+
+            // Reset the drop subscription before tearing down the systems it's attached to - keeps
+            // this rep's count final/stable and avoids relying on subscriber cleanup racing Terminate().
+            system1.EventStream.Unsubscribe(dropWatcher);
+            system2?.EventStream.Unsubscribe(dropWatcher);
+            var dropped = dropCounter.Count;
+
+            // force clean termination (split-client mode: only the local system - the server
+            // process owns system2's lifecycle and keeps serving subsequent reps/runs)
+            await Task.WhenAll(system2 == null
+                ? new[] { system1.Terminate() }
+                : new[] { system1.Terminate(), system2.Terminate() });
 
             var elapsedMilliseconds = sw.ElapsedMilliseconds;
             long throughput = elapsedMilliseconds == 0 ? -1 : (long)Math.Ceiling((double)totalMessagesReceived / elapsedMilliseconds * 1000);
@@ -399,7 +840,61 @@ namespace RemotePingPong
 
             Console.ForegroundColor = foregroundColor;
             Console.WriteLine("{0,10},{1,8},{2,10},{3,11}, {4,13}, {5,15}", numberOfClients, totalMessagesReceived, throughput, sw.Elapsed.TotalMilliseconds.ToString("F2", CultureInfo.InvariantCulture), startThreads, endThreads);
+
+            if (dropped > 0)
+            {
+                // Prominently marked (own line, own color) so a rep with drops is never mistaken
+                // for a clean run when skimming the table above - a nonzero count here means the
+                // outbound queue overflowed and the throughput/completion result for this rep is
+                // SUSPECT (see the drop-visibility comment where dropWatcher is subscribed).
+                var prevColor = Console.ForegroundColor;
+                Console.ForegroundColor = ConsoleColor.Magenta;
+                Console.WriteLine("  *** SUSPECT: dropped {0} (outbound queue overflow) ***", dropped);
+                Console.ForegroundColor = prevColor;
+            }
+
             return (redCount <= 3, bestThroughput, redCount);
+        }
+
+        /// <summary>
+        /// Thread-safe drop tally shared between a <see cref="DropCounterActor"/> and the harness
+        /// loop that reads it. Kept as a plain object (rather than actor state read via Ask) so the
+        /// count can be read synchronously right after unsubscribing, with no extra message round-trip.
+        /// </summary>
+        private sealed class DropCounter
+        {
+            private long _drops;
+
+            public void Increment() => Interlocked.Increment(ref _drops);
+
+            public long Count => Interlocked.Read(ref _drops);
+        }
+
+        /// <summary>
+        /// Minimal EventStream subscriber that tallies every <see cref="Dropped"/> event it sees into
+        /// a <see cref="DropCounter"/>. In single-process mode one instance (living on system1) is
+        /// subscribed to BOTH system1's and system2's EventStream for each rep - IActorRef.Tell
+        /// doesn't care which ActorSystem published the event, only that the target mailbox is
+        /// valid - so a single actor covers drops from either association direction (oneway sender
+        /// traffic system1->system2, or ping-pong echo/ack traffic in either direction). In split
+        /// mode each process runs its own instance against its own local system(s) and prints its
+        /// own SUSPECT lines: the client per rep (see Benchmark()), the server as a long-lived
+        /// periodic delta (see RunServer()).
+        /// </summary>
+        private class DropCounterActor : UntypedActor
+        {
+            private readonly DropCounter _counter;
+
+            public DropCounterActor(DropCounter counter)
+            {
+                _counter = counter;
+            }
+
+            protected override void OnReceive(object message)
+            {
+                if (message is Dropped)
+                    _counter.Increment();
+            }
         }
 
         private class AllStartedActor : UntypedActor
@@ -501,10 +996,12 @@ namespace RemotePingPong
         /// <summary>
         /// One-way firehose sender (lives on system1, paired 1:1 with a <see cref="OneWayReceiverActor"/>
         /// on system2). Implements credit-based flow control: unbounded fire-and-forget sending would
-        /// overflow Artery's bounded outbound queue (capacity 3072/association) and silently stall, so
-        /// this actor never has more than `windowSize` messages in flight per pair. It sends its whole
-        /// window up-front as credit, then tops back up by `ackEvery` messages every time the receiver
-        /// grants an <see cref="Ack"/>, until it has sent `maxMessages` total.
+        /// overflow Artery's bounded outbound queue (default capacity 3072/association, auto-raised
+        /// by ResolveQueueSize() - or overridden via "qsize=" - when window x clients would otherwise
+        /// exceed it) and silently stall, so this actor never has more than `windowSize` messages in
+        /// flight per pair. It sends its whole window up-front as credit, then tops back up by
+        /// `ackEvery` messages every time the receiver grants an <see cref="Ack"/>, until it has sent
+        /// `maxMessages` total.
         ///
         /// This actor also owns the latch (<see cref="TaskCompletionSource{TResult}"/>) that the
         /// benchmark harness awaits. It is fulfilled when the receiver reports <see cref="Complete"/> -
